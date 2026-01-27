@@ -1,5 +1,16 @@
 #include "Renderer.h"
-#include <GL/freeglut.h>
+
+#if defined(WIN32)
+  #pragma warning(disable:4996)
+  #include <GL/freeglut.h>
+#elif defined(__APPLE__) || defined(MACOSX)
+  #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  #define GL_SILENCE_DEPRECATION
+  #include <GLUT/glut.h>
+#else
+  #include <GL/freeglut.h>
+#endif
+
 #ifdef _WIN32
 #include <GL/glu.h>
 #endif
