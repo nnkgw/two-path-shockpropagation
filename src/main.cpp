@@ -56,6 +56,9 @@ void keyboard(unsigned char key, int x, int y) {
         case '3':
             g_simulation->setMode(Simulation::FIG3_DOWNWARD_DYNAMIC);
             break;
+        case '4':
+            g_simulation->setMode(Simulation::PHYSICS_SIM);
+            break;
         case ' ':
             g_simulation->nextStep();
             break;
@@ -177,7 +180,7 @@ void printUsage() {
     std::cout << "          by Xiong et al., SIGGRAPH 2025" << std::endl;
     std::cout << "----------------------------------------------------------" << std::endl;
     std::cout << " [CONTROLS]" << std::endl;
-    std::cout << "  1, 2, 3      : Switch between Fig.1, Fig.2, Fig.3" << std::endl;
+    std::cout << "  1, 2, 3, 4   : Switch between Fig.1, Fig.2, Fig.3, and Real-time Physics" << std::endl;
     std::cout << "  SPACE        : Next step" << std::endl;
     std::cout << "  BACKSPACE    : Previous step" << std::endl;
     std::cout << "  P            : Toggle Auto-play" << std::endl;

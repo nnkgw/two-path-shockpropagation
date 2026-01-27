@@ -11,7 +11,8 @@ public:
     enum Mode {
         FIG1_UPWARD,
         FIG2_DOWNWARD_STATIC,
-        FIG3_DOWNWARD_DYNAMIC
+        FIG3_DOWNWARD_DYNAMIC,
+        PHYSICS_SIM
     };
     
     Simulation();
@@ -34,6 +35,23 @@ private:
     void initializeBoxes();
     void updateStep();
     void printStepExplanation() const;
+
+    // Utility
+    int findBoxIndex(const Box* box) const;
+    
+    // Physics Engine Methods (Ten Minute Physics / XPBD style)
+    void stepPhysics(float dt);
+    void solveConstraints(float dt);
+    
+    // Detailed Collision Detection (SAT - Separating Axis Theorem)
+    struct Contact {
+        glm::vec3 normal;
+        float penetration;
+        glm::vec3 point;
+    };
+    bool checkCollision(const Box& a, const Box& b, Contact& contact);
+    void solveContact(Box& a, Box& b, const Contact& contact, float weightA, float weightB);
+    void solveGround(Box& box);
     
     Mode currentMode;
     int currentStep;
@@ -43,6 +61,15 @@ private:
     
     std::vector<Box> boxes;
     std::vector<Impulse> impulses;
+
+    // Contact flags per body (updated each substep)
+    // bit0: ground contact, bit1: contact with other body
+    std::vector<unsigned char> contactFlags;
+    
+    // Physics constants
+    glm::vec3 gravity;
+    int numSubsteps;
+    int numIterations;
 };
 
 #endif // SIMULATION_H

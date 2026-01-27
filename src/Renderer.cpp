@@ -133,14 +133,15 @@ void Renderer::renderBox(const Box& box) {
     glPushMatrix();
     
     glm::vec3 pos = box.getPosition();
-    glm::vec3 rot = box.getRotation();
+    glm::quat q = box.getOrientation();
     glm::vec3 size = box.getSize();
     glm::vec3 color = box.getColor();
     
     glTranslatef(pos.x, pos.y, pos.z);
-    glRotatef(glm::degrees(rot.x), 1.0f, 0.0f, 0.0f);
-    glRotatef(glm::degrees(rot.y), 0.0f, 1.0f, 0.0f);
-    glRotatef(glm::degrees(rot.z), 0.0f, 0.0f, 1.0f);
+    
+    // Convert quaternion to rotation matrix for OpenGL
+    glm::mat4 rotationMatrix = glm::mat4_cast(q);
+    glMultMatrixf(glm::value_ptr(rotationMatrix));
     
     glColor3f(color.r, color.g, color.b);
     
@@ -277,7 +278,7 @@ void Renderer::renderHUD(const Simulation& sim) {
     renderText(ss.str(), 10.0f, (float)windowHeight - 40.0f);
     
     renderText("Controls:", 10.0f, 120.0f);
-    renderText("1/2/3: Switch mode", 10.0f, 100.0f);
+    renderText("1/2/3/4: Switch mode", 10.0f, 100.0f);
     renderText("Space: Next step", 10.0f, 80.0f);
     renderText("Backspace: Previous step", 10.0f, 60.0f);
     renderText("P: Auto play", 10.0f, 40.0f);
