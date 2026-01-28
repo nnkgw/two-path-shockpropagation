@@ -133,34 +133,47 @@ void Simulation::stepPhysics(float dt) {
 }
 
 void Simulation::solveConstraints(float dt) {
+    // NOTE:
+    //  - FIG1_UPWARD is a pedagogical, step-by-step reproduction of Fig.1 in the paper.
+    //    In (a) and (b), we must NOT resolve the ground contact yet; otherwise X is pushed up
+    //    immediately and Y starts interpenetrating X, which contradicts Fig.1(a).
+    //  - Therefore, in FIG1 we only activate each constraint on the corresponding "Apply" step.
+    if (currentMode == FIG1_UPWARD) {
+        // Step mapping (Fig.1):
+        //  0: (a) Initial
+        //  1: (b) Eval: Ground-X          (no position change)
+        //  2: (c) Apply to X (Top)        (resolve Ground-X)
+        //  3: (d) Eval: X-Y               (no position change)
+        //  4: (e) Apply to Y (Top)        (resolve X-Y with X treated as infinite)
+        //  5: (f) Eval: Y-Z               (no position change)
+        //  6: (g) Apply to Z (Top)        (resolve Y-Z with Y treated as infinite)
+        if (currentStep >= 2) solveGround(boxes[0]); // Ground-X apply
+        if (currentStep >= 4) solveContact(boxes[0], boxes[1], {}, 0.0f, 1.0f); // X fixed, Y moves
+        if (currentStep >= 6) solveContact(boxes[1], boxes[2], {}, 0.0f, 1.0f); // Y fixed, Z moves
+        return;
+    }
+
     // 1. Upward Pass (Shock Propagation)
     // Solve from bottom to top, treating the bottom object as static (infinite mass)
-    
+
     // Ground constraints for all boxes
     for (auto& box : boxes) solveGround(box);
-    
-    if (currentMode == FIG1_UPWARD) {
-        // In FIG1, we only solve the pairs that have been "evaluated" in the current step
-        // In the paper's upward pass, the *bottom* is treated as static and the *top* is pushed out.
-        // The weight parameters follow this convention: (weightA for bottom, weightB for top).
-        if (currentStep >= 3) solveContact(boxes[0], boxes[1], {}, 0.0f, 1.0f); // X fixed, Y moves
-        if (currentStep >= 5) solveContact(boxes[1], boxes[2], {}, 0.0f, 1.0f); // Y fixed, Z moves
-    } else {
-        // In Downward Pass or Physics Sim, we perform the full Upward Pass first
-        // Check all pairs to prevent skipping collisions when boxes move horizontally
-        solveContact(boxes[0], boxes[1], {}, 0.0f, 1.0f);
-        solveContact(boxes[1], boxes[2], {}, 0.0f, 1.0f);
-        solveContact(boxes[0], boxes[2], {}, 0.0f, 1.0f); // X-Z direct contact if Y is pushed out
-        
-        // 2. Downward Pass (Standard Gauss-Seidel)
-        // Solve with normal mass ratios to allow settling
-        solveContact(boxes[1], boxes[2], {}, 0.5f, 0.5f);
-        solveContact(boxes[0], boxes[1], {}, 0.5f, 0.5f);
-        solveContact(boxes[0], boxes[2], {}, 0.5f, 0.5f);
-        
-        for (auto& box : boxes) solveGround(box);
-    }
+
+    // In Downward Pass or Physics Sim, we perform the full Upward Pass first
+    // Check all pairs to prevent skipping collisions when boxes move horizontally
+    solveContact(boxes[0], boxes[1], {}, 0.0f, 1.0f);
+    solveContact(boxes[1], boxes[2], {}, 0.0f, 1.0f);
+    solveContact(boxes[0], boxes[2], {}, 0.0f, 1.0f); // X-Z direct contact if Y is pushed out
+
+    // 2. Downward Pass (Standard Gauss-Seidel)
+    // Solve with normal mass ratios to allow settling
+    solveContact(boxes[1], boxes[2], {}, 0.5f, 0.5f);
+    solveContact(boxes[0], boxes[1], {}, 0.5f, 0.5f);
+    solveContact(boxes[0], boxes[2], {}, 0.5f, 0.5f);
+
+    for (auto& box : boxes) solveGround(box);
 }
+
 
 void Simulation::solveGround(Box& box) {
     float halfSize = box.getSize().y * 0.5f;
@@ -325,6 +338,13 @@ void Simulation::updateStep() {
         }
     } else if (currentMode == FIG2_DOWNWARD_STATIC) {
         switch (currentStep) {
+            case 0:
+                // Start of the downward pass (Fig.2): this begins from the end of the upward pass,
+                // where all penetrations have been resolved assuming the Bottom body is infinite.
+                boxes[0].setPosition(glm::vec3(0.0f, 0.5f, 0.0f));
+                boxes[1].setPosition(glm::vec3(0.0f, 1.5f, 0.0f));
+                boxes[2].setPosition(glm::vec3(0.0f, 2.5f, 0.0f));
+                break;
             case 1: impulses.push_back(Impulse(glm::vec3(0.0f, 2.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), yellowImpulse, 0.1f)); break;
             case 2: impulses.push_back(Impulse(glm::vec3(0.0f, 2.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f), redImpulse, 0.5f)); break;
             case 3: boxes[0].setInfiniteMass(true); break;
@@ -334,7 +354,11 @@ void Simulation::updateStep() {
         }
     } else if (currentMode == FIG3_DOWNWARD_DYNAMIC) {
         if (currentStep == 0) {
-            boxes[2].setPosition(boxes[2].getPosition() + glm::vec3(0.2f, 0.0f, 0.0f));
+            // Start of the dynamic downward pass (Fig.3): begin from the end of the upward pass,
+            // and introduce a small horizontal perturbation on Z.
+            boxes[0].setPosition(glm::vec3(0.0f, 0.5f, 0.0f));
+            boxes[1].setPosition(glm::vec3(0.0f, 1.5f, 0.0f));
+            boxes[2].setPosition(glm::vec3(0.2f, 2.5f, 0.0f));
         }
         switch (currentStep) {
             case 1: impulses.push_back(Impulse(glm::vec3(0.2f, 2.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), yellowImpulse, 0.1f)); break;
