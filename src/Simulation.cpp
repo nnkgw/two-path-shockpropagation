@@ -96,10 +96,17 @@ void Simulation::stepPhysics(float dt) {
             box.setPosition(box.getPosition() + box.getVelocity() * sdt);
             
             box.prevOrientation = box.getOrientation();
-            glm::vec3 w = box.getAngularVelocity();
-            glm::quat q = box.getOrientation();
-            glm::quat dq = 0.5f * glm::quat(0.0f, w.x, w.y, w.z) * q;
-            box.setOrientation(glm::normalize(q + dq * sdt));
+            if (currentMode == FIG3_DOWNWARD_DYNAMIC) {
+                // Fig.3 demo uses axis-aligned boxes; keep rotations disabled to avoid
+                // visually inconsistent penetrations with the AABB contact model.
+                box.setOrientation(glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+                box.setAngularVelocity(glm::vec3(0.0f));
+            } else {
+                glm::vec3 w = box.getAngularVelocity();
+                glm::quat q = box.getOrientation();
+                glm::quat dq = 0.5f * glm::quat(0.0f, w.x, w.y, w.z) * q;
+                box.setOrientation(glm::normalize(q + dq * sdt));
+            }
         }
 
         // 2. Solve constraints
@@ -118,8 +125,14 @@ void Simulation::stepPhysics(float dt) {
             if (glm::length(newVel) > maxVel) {
                 newVel = glm::normalize(newVel) * maxVel;
             }
-            box.setVelocity(newVel * 0.95f); // Stronger damping
+            float velDamping = (currentMode == FIG3_DOWNWARD_DYNAMIC) ? 0.9998f : 0.95f;
+            box.setVelocity(newVel * velDamping); // Stronger damping (relaxed for Fig.3 dynamic)
             
+            if (currentMode == FIG3_DOWNWARD_DYNAMIC) {
+                box.setOrientation(glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
+                box.setAngularVelocity(glm::vec3(0.0f));
+                continue;
+            }
             glm::quat dq = box.getOrientation() * glm::inverse(box.prevOrientation);
             glm::vec3 w(dq.x, dq.y, dq.z);
             float angle = 2.0f * acos(glm::clamp(dq.w, -1.0f, 1.0f));
@@ -228,7 +241,7 @@ void Simulation::solveContact(Box& a, Box& b, const Contact& contact, float weig
         }
         
         // Apply friction/damping to stabilize the stack
-        if (axis == 1) { // Vertical contact
+        if (axis == 1 && currentMode != FIG3_DOWNWARD_DYNAMIC) { // Vertical contact
             glm::vec3 vA = a.getVelocity();
             glm::vec3 vB = b.getVelocity();
             // Stronger horizontal damping to keep the stack perfectly vertical
@@ -358,11 +371,18 @@ void Simulation::updateStep() {
             // and introduce a small horizontal perturbation on Z.
             boxes[0].setPosition(glm::vec3(0.0f, 0.5f, 0.0f));
             boxes[1].setPosition(glm::vec3(0.0f, 1.5f, 0.0f));
-            boxes[2].setPosition(glm::vec3(0.2f, 2.5f, 0.0f));
+            // Overhang + small lateral drift so Z slides off Y and falls.
+            boxes[2].setPosition(glm::vec3(0.45f, 2.5f, 0.0f));
+            boxes[0].setVelocity(glm::vec3(0.0f));
+            boxes[1].setVelocity(glm::vec3(0.0f));
+            boxes[2].setVelocity(glm::vec3(1.2f, 0.0f, 0.0f));
+            boxes[0].setAngularVelocity(glm::vec3(0.0f));
+            boxes[1].setAngularVelocity(glm::vec3(0.0f));
+            boxes[2].setAngularVelocity(glm::vec3(0.0f));
         }
         switch (currentStep) {
-            case 1: impulses.push_back(Impulse(glm::vec3(0.2f, 2.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), yellowImpulse, 0.1f)); break;
-            case 2: impulses.push_back(Impulse(glm::vec3(0.2f, 2.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f), redImpulse, 0.5f)); break;
+            case 1: impulses.push_back(Impulse(glm::vec3(0.45f, 2.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), yellowImpulse, 0.1f)); break;
+            case 2: impulses.push_back(Impulse(glm::vec3(0.45f, 2.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f), redImpulse, 0.5f)); break;
             case 5: impulses.push_back(Impulse(glm::vec3(0.0f, 1.0f, 0.0f), glm::vec3(0.0f, -1.0f, 0.0f), blueImpulse, 0.5f)); break;
             case 7: impulses.push_back(Impulse(glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f), yellowImpulse, 0.5f)); break;
         }
