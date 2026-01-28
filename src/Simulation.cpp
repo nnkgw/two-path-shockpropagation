@@ -1,9 +1,94 @@
 #include "Simulation.h"
+
+#define GLM_ENABLE_EXPERIMENTAL
+
 #include <glm/gtc/constants.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtx/norm.hpp>
 #include <iostream>
 #include <algorithm>
+
+
+namespace {
+constexpr float kSatEps = 1e-6f;
+
+static glm::mat3 computeInvInertiaWorld(const Box& b, float weight) {
+    if (weight <= 0.0f) return glm::mat3(0.0f);
+    float m = b.getMass();
+    if (m <= 0.0f) return glm::mat3(0.0f);
+
+    glm::vec3 s = b.getSize(); // full lengths
+    float Ixx = (m / 12.0f) * (s.y * s.y + s.z * s.z);
+    float Iyy = (m / 12.0f) * (s.x * s.x + s.z * s.z);
+    float Izz = (m / 12.0f) * (s.x * s.x + s.y * s.y);
+
+    glm::mat3 invLocal(0.0f);
+    invLocal[0][0] = (Ixx > 0.0f) ? (1.0f / Ixx) : 0.0f;
+    invLocal[1][1] = (Iyy > 0.0f) ? (1.0f / Iyy) : 0.0f;
+    invLocal[2][2] = (Izz > 0.0f) ? (1.0f / Izz) : 0.0f;
+
+    glm::mat3 R = glm::mat3_cast(b.getOrientation());
+    glm::mat3 invWorld = R * invLocal * glm::transpose(R);
+    return invWorld * weight;
+}
+
+static glm::vec3 supportPoint(const Box& b, const glm::vec3& dir) {
+    glm::vec3 half = b.getSize() * 0.5f;
+    glm::mat3 R = glm::mat3_cast(b.getOrientation());
+
+    glm::vec3 local(
+        (glm::dot(dir, R[0]) >= 0.0f) ? half.x : -half.x,
+        (glm::dot(dir, R[1]) >= 0.0f) ? half.y : -half.y,
+        (glm::dot(dir, R[2]) >= 0.0f) ? half.z : -half.z
+    );
+    return b.getPosition() + R * local;
+}
+
+static void integrateOrientation(Box& b, float dt) {
+    glm::vec3 w = b.getAngularVelocity();
+    glm::quat q = b.getOrientation();
+    glm::quat dq = 0.5f * glm::quat(0.0f, w.x, w.y, w.z) * q;
+    b.setOrientation(glm::normalize(q + dq * dt));
+}
+
+static float computeMinYVertex(const Box& b, glm::vec3* outPoint) {
+    glm::vec3 half = b.getSize() * 0.5f;
+    glm::mat3 R = glm::mat3_cast(b.getOrientation());
+    glm::vec3 c = b.getPosition();
+
+    float minY = 1e30f;
+    glm::vec3 minP(0.0f);
+    for (int sx = -1; sx <= 1; sx += 2) {
+        for (int sy = -1; sy <= 1; sy += 2) {
+            for (int sz = -1; sz <= 1; sz += 2) {
+                glm::vec3 local((float)sx * half.x, (float)sy * half.y, (float)sz * half.z);
+                glm::vec3 p = c + R * local;
+                if (p.y < minY) { minY = p.y; minP = p; }
+            }
+        }
+    }
+    if (outPoint) *outPoint = minP;
+    return minY;
+}
+
+static int computeVertices(const Box& b, glm::vec3 outV[8]) {
+    glm::vec3 half = b.getSize() * 0.5f;
+    glm::mat3 R = glm::mat3_cast(b.getOrientation());
+    glm::vec3 c = b.getPosition();
+
+    int idx = 0;
+    for (int sx = -1; sx <= 1; sx += 2) {
+        for (int sy = -1; sy <= 1; sy += 2) {
+            for (int sz = -1; sz <= 1; sz += 2) {
+                glm::vec3 local((float)sx * half.x, (float)sy * half.y, (float)sz * half.z);
+                outV[idx++] = c + R * local;
+            }
+        }
+    }
+    return idx;
+}
+} // namespace
 
 Simulation::Simulation()
     : currentMode(FIG1_UPWARD), currentStep(0), isAutoPlay(false),
@@ -95,18 +180,8 @@ void Simulation::stepPhysics(float dt) {
             box.prevPosition = box.getPosition();
             box.setPosition(box.getPosition() + box.getVelocity() * sdt);
             
-            box.prevOrientation = box.getOrientation();
-            if (currentMode == FIG3_DOWNWARD_DYNAMIC) {
-                // Fig.3 demo uses axis-aligned boxes; keep rotations disabled to avoid
-                // visually inconsistent penetrations with the AABB contact model.
-                box.setOrientation(glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
-                box.setAngularVelocity(glm::vec3(0.0f));
-            } else {
-                glm::vec3 w = box.getAngularVelocity();
-                glm::quat q = box.getOrientation();
-                glm::quat dq = 0.5f * glm::quat(0.0f, w.x, w.y, w.z) * q;
-                box.setOrientation(glm::normalize(q + dq * sdt));
-            }
+                        box.prevOrientation = box.getOrientation();
+            integrateOrientation(box, sdt);
         }
 
         // 2. Solve constraints
@@ -117,6 +192,15 @@ void Simulation::stepPhysics(float dt) {
         // 3. Update velocities and apply damping
         for (auto& box : boxes) {
             if (box.isInfiniteMass()) continue;
+
+            // Fig.1/Fig.2 are presented as quasi-static, step-by-step constraint projections.
+            // Do not accumulate the "velocity" induced by positional correction, or the
+            // demonstration can drift/explode.
+            if (currentMode == FIG1_UPWARD || currentMode == FIG2_DOWNWARD_STATIC) {
+                box.setVelocity(glm::vec3(0.0f));
+                box.setAngularVelocity(glm::vec3(0.0f));
+                continue;
+            }
             
             glm::vec3 newVel = (box.getPosition() - box.prevPosition) / sdt;
             
@@ -125,22 +209,70 @@ void Simulation::stepPhysics(float dt) {
             if (glm::length(newVel) > maxVel) {
                 newVel = glm::normalize(newVel) * maxVel;
             }
-            float velDamping = (currentMode == FIG3_DOWNWARD_DYNAMIC) ? 0.9998f : 0.95f;
-            box.setVelocity(newVel * velDamping); // Stronger damping (relaxed for Fig.3 dynamic)
-            
-            if (currentMode == FIG3_DOWNWARD_DYNAMIC) {
-                box.setOrientation(glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
-                box.setAngularVelocity(glm::vec3(0.0f));
-                continue;
-            }
+            float velDamping = (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM) ? 0.9995f : 0.95f;
+            glm::vec3 v = newVel * velDamping;
+
+            // Angular velocity from the orientation change during constraint projection.
             glm::quat dq = box.getOrientation() * glm::inverse(box.prevOrientation);
-            glm::vec3 w(dq.x, dq.y, dq.z);
+            glm::vec3 axis(dq.x, dq.y, dq.z);
             float angle = 2.0f * acos(glm::clamp(dq.w, -1.0f, 1.0f));
-            if (angle > 0.001f) {
-                box.setAngularVelocity(glm::normalize(w) * (angle / sdt) * 0.9f);
-            } else {
-                box.setAngularVelocity(glm::vec3(0.0f));
+
+            glm::vec3 angVel(0.0f);
+            if (angle > 0.001f && glm::length2(axis) > 1e-12f) {
+                angVel = glm::normalize(axis) * (angle / sdt) * 0.98f;
             }
+
+            // Ground friction (kinetic + simple static) for the dynamic modes.
+            if (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM) {
+                glm::vec3 groundP;
+                float minY = computeMinYVertex(box, &groundP);
+                bool onGround = (minY <= 0.01f);
+
+                // Prevent "sinking" by canceling downward velocity when grounded.
+                if (onGround && v.y < 0.0f) v.y = 0.0f;
+
+                // Kinetic friction: decelerate the horizontal velocity by mu*g.
+                // Also apply the corresponding torque around the contact point so the box can
+                // naturally rotate while sliding and settle flat.
+                if (onGround) {
+                    glm::vec3 vt0(v.x, 0.0f, v.z);
+
+                    float mu = 0.7f;
+                    float g = glm::abs(gravity.y);
+                    float maxDelta = mu * g * sdt;
+                    float speed = glm::length(vt0);
+                    if (speed <= maxDelta) {
+                        v.x = 0.0f;
+                        v.z = 0.0f;
+                    } else if (speed > 1e-8f) {
+                        float newSpeed = speed - maxDelta;
+                        glm::vec3 vt = vt0 * (newSpeed / speed);
+                        v.x = vt.x;
+                        v.z = vt.z;
+                    }
+
+                    glm::vec3 dv(v.x - vt0.x, 0.0f, v.z - vt0.z);
+                    float m = box.getMass();
+                    if (m > 0.0f && glm::length2(dv) > 1e-12f) {
+                        glm::mat3 invI = computeInvInertiaWorld(box, 1.0f);
+                        glm::vec3 r = groundP - box.getPosition();
+                        glm::vec3 J = m * dv;
+                        angVel += invI * glm::cross(r, J);
+                    }
+
+                    float maxAng = 25.0f;
+                    float angLen = glm::length(angVel);
+                    if (angLen > maxAng) angVel = (angVel / angLen) * maxAng;
+                }
+
+                // Rolling / angular friction when grounded.
+                if (onGround) {
+                    angVel *= 0.985f;
+                }
+            }
+
+            box.setVelocity(v);
+            box.setAngularVelocity(angVel);
         }
     }
 }
@@ -189,62 +321,240 @@ void Simulation::solveConstraints(float dt) {
 
 
 void Simulation::solveGround(Box& box) {
-    float halfSize = box.getSize().y * 0.5f;
-    float penetration = halfSize - box.getPosition().y;
-    if (penetration > 0.0f) {
-        glm::vec3 pos = box.getPosition();
-        pos.y += penetration;
-        box.setPosition(pos);
+    if (box.isInfiniteMass()) return;
+
+    glm::vec3 n(0.0f, 1.0f, 0.0f);
+    bool allowRotation = (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM);
+
+    // Static / step-by-step modes: resolve using only the minimum vertex.
+    // This avoids multi-vertex over-correction that can break Fig.1/2.
+    if (!allowRotation) {
+        glm::vec3 pMin;
+        float minY = computeMinYVertex(box, &pMin);
+        if (minY < 0.0f) {
+            // Full correction is safe here because we are using only the minimum vertex.
+            float dy = (-minY);
+            box.setPosition(box.getPosition() + glm::vec3(0.0f, dy, 0.0f));
+        }
+        return;
+    }
+
+    // Dynamic modes: use a Gauss-Seidel style ground solve.
+    // Each mini-iteration resolves only the currently most-penetrating vertex,
+    // recomputing vertices after applying the correction. This prevents "pushing" the box
+    // multiple times by the same penetration amount.
+    float invMass = box.getInvMass();
+    glm::mat3 invI = computeInvInertiaWorld(box, 1.0f);
+
+    // Clamp per-iteration correction to avoid explosive position updates -> large velocities.
+    constexpr float kMaxCorr = 0.05f;
+
+    for (int it = 0; it < 4; ++it) {
+        glm::vec3 V[8];
+        computeVertices(box, V);
+
+        int best = -1;
+        float bestPen = 0.0f;
+        for (int i = 0; i < 8; ++i) {
+            float pen = -V[i].y;
+            if (pen > bestPen) { bestPen = pen; best = i; }
+        }
+        if (best < 0 || bestPen <= 0.0f) break;
+
+        glm::vec3 p = V[best];
+        glm::vec3 r = p - box.getPosition();
+        glm::vec3 rn = glm::cross(r, n);
+        float k = glm::dot(n, glm::cross(invI * rn, r));
+        float denom = invMass + k;
+        if (denom <= 0.0f) break;
+
+        float lambda = bestPen / denom;
+        glm::vec3 corr = lambda * n;
+        float corrLen = glm::length(corr);
+        if (corrLen > kMaxCorr) corr *= (kMaxCorr / corrLen);
+
+        box.setPosition(box.getPosition() + corr * invMass);
+
+        glm::vec3 dtheta = invI * glm::cross(r, corr);
+        glm::quat q = box.getOrientation();
+        glm::quat dq = 0.5f * glm::quat(0.0f, dtheta.x, dtheta.y, dtheta.z) * q;
+        box.setOrientation(glm::normalize(q + dq));
     }
 }
 
-void Simulation::solveContact(Box& a, Box& b, const Contact& contact, float weightA, float weightB) {
-    // 3D Box-Box Collision (Faithful to original paper: resolving all axes)
-    glm::vec3 posA = a.getPosition();
-    glm::vec3 posB = b.getPosition();
-    glm::vec3 sizeA = a.getSize();
-    glm::vec3 sizeB = b.getSize();
 
-    glm::vec3 diff = posB - posA;
-    glm::vec3 min_dist = (sizeA + sizeB) * 0.5f;
-    glm::vec3 overlap = min_dist - glm::abs(diff);
+bool Simulation::checkCollision(const Box& a, const Box& b, Contact& contact) {
+    // Oriented box vs oriented box using SAT (15 axes).
+    glm::vec3 aHalf = a.getSize() * 0.5f;
+    glm::vec3 bHalf = b.getSize() * 0.5f;
 
-    // If overlapping on all axes, we have a collision
-    if (overlap.x > 0 && overlap.y > 0 && overlap.z > 0) {
-        // For stacking stability, we prioritize the vertical axis (Y) 
-        // if the horizontal overlap is significant. This prevents boxes 
-        // from sliding sideways when they should be pushed upwards.
-        int axis = 1; // Default to Y-axis for stacking
-        
-        // Only use X or Z if the overlap in those directions is much smaller,
-        // indicating a clear side-to-side collision.
-        if (overlap.x < overlap.y * 0.5f && overlap.x < overlap.z) axis = 0;
-        else if (overlap.z < overlap.y * 0.5f && overlap.z < overlap.x) axis = 2;
+    glm::mat3 RA = glm::mat3_cast(a.getOrientation());
+    glm::mat3 RB = glm::mat3_cast(b.getOrientation());
 
-        float penetration = overlap[axis];
-        glm::vec3 normal(0.0f);
-        normal[axis] = (diff[axis] > 0) ? 1.0f : -1.0f;
+    glm::vec3 Aaxis[3] = { RA[0], RA[1], RA[2] };
+    glm::vec3 Baxis[3] = { RB[0], RB[1], RB[2] };
 
-        float invMassA = a.getInvMass() * weightA;
-        float invMassB = b.getInvMass() * weightB;
-        float totalInvMass = invMassA + invMassB;
-        if (totalInvMass <= 0.0f) return;
+    float R[3][3];
+    float AbsR[3][3];
 
-        // Resolve the penetration
-        glm::vec3 correction = normal * (penetration / totalInvMass);
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            R[i][j] = glm::dot(Aaxis[i], Baxis[j]);
+            AbsR[i][j] = glm::abs(R[i][j]) + kSatEps;
+        }
+    }
 
+    glm::vec3 tV = b.getPosition() - a.getPosition();
+    float t[3] = {
+        glm::dot(tV, Aaxis[0]),
+        glm::dot(tV, Aaxis[1]),
+        glm::dot(tV, Aaxis[2])
+    };
+
+    float minPen = 1e30f;
+    glm::vec3 bestAxis(0.0f);
+
+    auto considerAxis = [&](const glm::vec3& axisWorld, float pen) {
+        if (pen < minPen) {
+            minPen = pen;
+            bestAxis = axisWorld;
+        }
+    };
+
+    // Test axes L = A0, A1, A2
+    for (int i = 0; i < 3; i++) {
+        float ra = aHalf[i];
+        float rb = bHalf.x * AbsR[i][0] + bHalf.y * AbsR[i][1] + bHalf.z * AbsR[i][2];
+        float dist = glm::abs(t[i]);
+        float pen = (ra + rb) - dist;
+        if (pen < 0.0f) return false;
+        considerAxis(Aaxis[i], pen);
+    }
+
+    // Test axes L = B0, B1, B2
+    for (int j = 0; j < 3; j++) {
+        float ra = aHalf.x * AbsR[0][j] + aHalf.y * AbsR[1][j] + aHalf.z * AbsR[2][j];
+        float rb = bHalf[j];
+        float dist = glm::abs(t[0] * R[0][j] + t[1] * R[1][j] + t[2] * R[2][j]);
+        float pen = (ra + rb) - dist;
+        if (pen < 0.0f) return false;
+        considerAxis(Baxis[j], pen);
+    }
+
+    // Test axes L = Ai x Bj
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++) {
+            glm::vec3 axis = glm::cross(Aaxis[i], Baxis[j]);
+            float len2 = glm::length2(axis);
+            if (len2 < 1e-10f) continue;
+
+            float ra = aHalf[(i + 1) % 3] * AbsR[(i + 2) % 3][j] + aHalf[(i + 2) % 3] * AbsR[(i + 1) % 3][j];
+            float rb = bHalf[(j + 1) % 3] * AbsR[i][(j + 2) % 3] + bHalf[(j + 2) % 3] * AbsR[i][(j + 1) % 3];
+            float dist = glm::abs(t[(i + 2) % 3] * R[(i + 1) % 3][j] - t[(i + 1) % 3] * R[(i + 2) % 3][j]);
+
+            float pen = (ra + rb) - dist;
+            if (pen < 0.0f) return false;
+
+            float invLen = 1.0f / glm::sqrt(len2);
+            considerAxis(axis * invLen, pen * invLen);
+        }
+    }
+
+    if (glm::length2(bestAxis) < 1e-12f) return false;
+
+    glm::vec3 n = glm::normalize(bestAxis);
+    if (glm::dot(n, tV) < 0.0f) n = -n;
+
+    contact.normal = n;
+    contact.penetration = minPen;
+
+    // Approximate contact point using support points along +/- normal.
+    glm::vec3 pA = supportPoint(a, n);
+    glm::vec3 pB = supportPoint(b, -n);
+    contact.point = 0.5f * (pA + pB);
+
+    return true;
+}
+
+void Simulation::solveContact(Box& a, Box& b, const Contact& contactIn, float weightA, float weightB) {
+    (void)contactIn;
+
+    Contact c;
+    if (!checkCollision(a, b, c)) return;
+
+    bool allowRotation = (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM);
+
+    glm::vec3 n = c.normal;
+    float penetration = c.penetration;
+    glm::vec3 p = c.point;
+
+    float invMassA = a.getInvMass() * weightA;
+    float invMassB = b.getInvMass() * weightB;
+
+    glm::mat3 invIA = computeInvInertiaWorld(a, weightA);
+    glm::mat3 invIB = computeInvInertiaWorld(b, weightB);
+
+    glm::vec3 rA = p - a.getPosition();
+    glm::vec3 rB = p - b.getPosition();
+
+    float kA = 0.0f;
+    float kB = 0.0f;
+    if (allowRotation && invMassA > 0.0f) {
+        glm::vec3 rnA = glm::cross(rA, n);
+        kA = glm::dot(n, glm::cross(invIA * rnA, rA));
+    }
+    if (allowRotation && invMassB > 0.0f) {
+        glm::vec3 rnB = glm::cross(rB, n);
+        kB = glm::dot(n, glm::cross(invIB * rnB, rB));
+    }
+
+    float denom = invMassA + invMassB + (allowRotation ? (kA + kB) : 0.0f);
+    if (denom <= 0.0f) return;
+
+    // Soft positional correction to avoid "explosive" push-outs.
+    // In the real-time modes, both the upward and downward passes can be applied
+    // many times (iterations * substeps). Applying full penetration correction each
+    // time can inject large positional changes -> large velocities.
+    float slop = (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM) ? 0.001f : 0.0f;
+    float pen = penetration - slop;
+    if (pen <= 0.0f) return;
+
+    float relax = 1.0f;
+    if (currentMode == PHYSICS_SIM) relax = 0.25f;
+    else if (currentMode == FIG3_DOWNWARD_DYNAMIC) relax = 0.35f;
+    else if (currentMode == FIG2_DOWNWARD_STATIC) relax = 0.6f;
+
+    float lambda = (pen / denom) * relax;
+    glm::vec3 corr = lambda * n;
+
+    // Clamp per-call correction to keep the solver stable.
+    float maxCorr = (currentMode == PHYSICS_SIM) ? 0.03f : 0.06f;
+    float corrLen = glm::length(corr);
+    if (corrLen > maxCorr) corr *= (maxCorr / corrLen);
+
+    // Positional correction (non-penetration).
+    if (invMassA > 0.0f) a.setPosition(a.getPosition() - corr * invMassA);
+    if (invMassB > 0.0f) b.setPosition(b.getPosition() + corr * invMassB);
+
+    // Rotational correction (dynamic modes only).
+    if (allowRotation) {
         if (invMassA > 0.0f) {
-            a.setPosition(a.getPosition() - correction * invMassA);
+            glm::vec3 dtheta = -(invIA * glm::cross(rA, corr));
+            glm::quat q = a.getOrientation();
+            glm::quat dq = 0.5f * glm::quat(0.0f, dtheta.x, dtheta.y, dtheta.z) * q;
+            a.setOrientation(glm::normalize(q + dq));
         }
         if (invMassB > 0.0f) {
-            b.setPosition(b.getPosition() + correction * invMassB);
+            glm::vec3 dtheta = (invIB * glm::cross(rB, corr));
+            glm::quat q = b.getOrientation();
+            glm::quat dq = 0.5f * glm::quat(0.0f, dtheta.x, dtheta.y, dtheta.z) * q;
+            b.setOrientation(glm::normalize(q + dq));
         }
-        
-        // Apply friction/damping to stabilize the stack
-        if (axis == 1 && currentMode != FIG3_DOWNWARD_DYNAMIC) { // Vertical contact
+    } else {
+        // For the static figure modes, keep the stack visually vertical.
+        if (glm::abs(n.y) > 0.9f) {
             glm::vec3 vA = a.getVelocity();
             glm::vec3 vB = b.getVelocity();
-            // Stronger horizontal damping to keep the stack perfectly vertical
             a.setVelocity(glm::vec3(vA.x * 0.8f, vA.y, vA.z * 0.8f));
             b.setVelocity(glm::vec3(vB.x * 0.8f, vB.y, vB.z * 0.8f));
         }
