@@ -35,9 +35,6 @@ private:
     void initializeBoxes();
     void updateStep();
     void printStepExplanation() const;
-
-    // Utility
-    int findBoxIndex(const Box* box) const;
     
     // Physics Engine Methods (Ten Minute Physics / XPBD style)
     void stepPhysics(float dt);
@@ -61,10 +58,6 @@ private:
     
     std::vector<Box> boxes;
     std::vector<Impulse> impulses;
-
-    // Contact flags per body (updated each substep)
-    // bit0: ground contact, bit1: contact with other body
-    std::vector<unsigned char> contactFlags;
     
     // Physics constants
     glm::vec3 gravity;

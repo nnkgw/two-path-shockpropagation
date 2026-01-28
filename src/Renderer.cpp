@@ -111,8 +111,13 @@ void Renderer::renderScene(const Simulation& sim) {
     
     renderGround();
     
+    // Render boxes first
     for (const auto& box : sim.getBoxes()) {
         renderBox(box);
+    }
+    
+    // Render all labels after all boxes to ensure they are on top
+    for (const auto& box : sim.getBoxes()) {
         renderText3D(box.getName(), box.getPosition() + glm::vec3(-1.2f, 0.0f, 0.0f), glm::vec3(1.0f));
     }
     
