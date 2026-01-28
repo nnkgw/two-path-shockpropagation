@@ -247,11 +247,21 @@ void Renderer::renderText(const std::string& text, float x, float y) {
 void Renderer::renderText3D(const std::string& text, const glm::vec3& pos, const glm::vec3& color) {
     glDisable(GL_LIGHTING);
     glDisable(GL_DEPTH_TEST);
+    
+    // Draw shadow (black, slightly offset)
+    glColor3f(0.0f, 0.0f, 0.0f);
+    glRasterPos3f(pos.x + 0.02f, pos.y - 0.02f, pos.z);
+    for (char c : text) {
+        glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, c);
+    }
+    
+    // Draw main text (white)
     glColor3f(color.r, color.g, color.b);
     glRasterPos3f(pos.x, pos.y, pos.z);
     for (char c : text) {
         glutBitmapCharacter(GLUT_BITMAP_HELVETICA_18, c);
     }
+    
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
 }
