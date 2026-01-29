@@ -185,7 +185,12 @@ void Simulation::stepPhysics(float dt) {
         }
 
         // 2. Solve constraints
-        for (int i = 0; i < numIterations; i++) {
+        // Fig.1 uses its own per-layer convergence loop inside solveConstraints().
+        // Calling it numIterations times would effectively multiply the intended work
+        // and can lead to over-correction.
+        int iterations = numIterations;
+        if (currentMode == FIG1_UPWARD) iterations = 1;
+        for (int i = 0; i < iterations; i++) {
             solveConstraints(sdt);
         }
 
@@ -292,9 +297,32 @@ void Simulation::solveConstraints(float dt) {
         //  4: (e) Apply to Y (Top)        (resolve X-Y with X treated as infinite)
         //  5: (f) Eval: Y-Z               (no position change)
         //  6: (g) Apply to Z (Top)        (resolve Y-Z with Y treated as infinite)
-        if (currentStep >= 2) solveGround(boxes[0]); // Ground-X apply
-        if (currentStep >= 4) solveContact(boxes[0], boxes[1], {}, 0.0f, 1.0f); // X fixed, Y moves
-        if (currentStep >= 6) solveContact(boxes[1], boxes[2], {}, 0.0f, 1.0f); // Y fixed, Z moves
+        // In the paper, each layer is iterated until convergence.
+        // Here we emulate that by iterating each active constraint until the remaining
+        // penetration is below a small tolerance.
+        constexpr int kMaxLayerIters = 75;
+        constexpr float kTolPen = 5e-4f;
+
+        auto solveGroundUntil = [&](Box& box) {
+            for (int it = 0; it < kMaxLayerIters; ++it) {
+                float minY = computeMinYVertex(box, nullptr);
+                if (minY >= -kTolPen) break;
+                solveGround(box);
+            }
+        };
+
+        auto solvePairUntil = [&](Box& a, Box& b, float wA, float wB) {
+            for (int it = 0; it < kMaxLayerIters; ++it) {
+                Contact c;
+                if (!checkCollision(a, b, c)) break;
+                if (c.penetration <= kTolPen) break;
+                solveContact(a, b, c, wA, wB);
+            }
+        };
+
+        if (currentStep >= 2) solveGroundUntil(boxes[0]);
+        if (currentStep >= 4) solvePairUntil(boxes[0], boxes[1], 0.0f, 1.0f);
+        if (currentStep >= 6) solvePairUntil(boxes[1], boxes[2], 0.0f, 1.0f);
         return;
     }
 
