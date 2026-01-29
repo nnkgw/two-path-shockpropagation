@@ -92,7 +92,7 @@ static int computeVertices(const Box& b, glm::vec3 outV[8]) {
 
 Simulation::Simulation()
     : currentMode(FIG1_UPWARD), currentStep(0), isAutoPlay(false),
-      autoPlayTimer(0.0f), autoPlayInterval(1.5f),
+      autoPlayTimer(0.0f), autoPlayInterval(1.5f), figStepSolved(false),
       gravity(0.0f, -9.81f, 0.0f), numSubsteps(25), numIterations(40) {
     initializeBoxes();
     updateStep();
@@ -147,8 +147,29 @@ void Simulation::autoPlay(bool enable) {
 
 void Simulation::update(float deltaTime) {
     // Limit deltaTime to prevent instability
-    float dt = std::min(deltaTime, 0.016f); 
-    stepPhysics(dt);
+    float dt = std::min(deltaTime, 0.016f);
+
+    // Fig.1/Fig.2 are step-by-step "figure reproduction" modes.
+    // To keep Eval steps from changing state, we only advance the physics once per Apply step.
+    if (currentMode == FIG1_UPWARD || currentMode == FIG2_DOWNWARD_STATIC) {
+        auto isApplyStep = [&](Mode mode, int step) -> bool {
+            if (mode == FIG1_UPWARD) {
+                return (step == 2 || step == 4 || step == 6);
+            }
+            if (mode == FIG2_DOWNWARD_STATIC) {
+                return (step == 1 || step == 2 || step == 4 || step == 5 || step == 7);
+            }
+            return false;
+        };
+
+        if (isApplyStep(currentMode, currentStep) && !figStepSolved) {
+            // Use a fixed dt so the snapshots are deterministic across machines.
+            stepPhysics(1.0f / 60.0f);
+            figStepSolved = true;
+        }
+    } else {
+        stepPhysics(dt);
+    }
 
     if (isAutoPlay) {
         autoPlayTimer += deltaTime;
@@ -165,9 +186,11 @@ void Simulation::update(float deltaTime) {
 
 void Simulation::stepPhysics(float dt) {
     if (dt <= 0.0f) return;
-    float sdt = dt / numSubsteps;
+    int substeps = numSubsteps;
+    if (currentMode == FIG1_UPWARD || currentMode == FIG2_DOWNWARD_STATIC) substeps = 1;
+    float sdt = dt / (float)substeps;
 
-    for (int s = 0; s < numSubsteps; s++) {
+    for (int s = 0; s < substeps; s++) {
         // 1. Predict positions
         for (auto& box : boxes) {
             if (box.isInfiniteMass()) continue;
@@ -215,6 +238,7 @@ void Simulation::stepPhysics(float dt) {
                 newVel = glm::normalize(newVel) * maxVel;
             }
             float velDamping = (currentMode == FIG3_DOWNWARD_DYNAMIC || currentMode == PHYSICS_SIM) ? 0.9995f : 0.95f;
+            if (currentMode == FIG1_UPWARD || currentMode == FIG2_DOWNWARD_STATIC) velDamping = 0.6f;
             glm::vec3 v = newVel * velDamping;
 
             // Angular velocity from the orientation change during constraint projection.
@@ -288,43 +312,283 @@ void Simulation::solveConstraints(float dt) {
     //    In (a) and (b), we must NOT resolve the ground contact yet; otherwise X is pushed up
     //    immediately and Y starts interpenetrating X, which contradicts Fig.1(a).
     //  - Therefore, in FIG1 we only activate each constraint on the corresponding "Apply" step.
-    if (currentMode == FIG1_UPWARD) {
-        // Step mapping (Fig.1):
-        //  0: (a) Initial
-        //  1: (b) Eval: Ground-X          (no position change)
-        //  2: (c) Apply to X (Top)        (resolve Ground-X)
-        //  3: (d) Eval: X-Y               (no position change)
-        //  4: (e) Apply to Y (Top)        (resolve X-Y with X treated as infinite)
-        //  5: (f) Eval: Y-Z               (no position change)
-        //  6: (g) Apply to Z (Top)        (resolve Y-Z with Y treated as infinite)
-        // In the paper, each layer is iterated until convergence.
-        // Here we emulate that by iterating each active constraint until the remaining
-        // penetration is below a small tolerance.
-        constexpr int kMaxLayerIters = 75;
-        constexpr float kTolPen = 5e-4f;
-
-        auto solveGroundUntil = [&](Box& box) {
-            for (int it = 0; it < kMaxLayerIters; ++it) {
-                float minY = computeMinYVertex(box, nullptr);
-                if (minY >= -kTolPen) break;
-                solveGround(box);
-            }
-        };
-
-        auto solvePairUntil = [&](Box& a, Box& b, float wA, float wB) {
-            for (int it = 0; it < kMaxLayerIters; ++it) {
-                Contact c;
-                if (!checkCollision(a, b, c)) break;
-                if (c.penetration <= kTolPen) break;
-                solveContact(a, b, c, wA, wB);
-            }
-        };
-
-        if (currentStep >= 2) solveGroundUntil(boxes[0]);
-        if (currentStep >= 4) solvePairUntil(boxes[0], boxes[1], 0.0f, 1.0f);
-        if (currentStep >= 6) solvePairUntil(boxes[1], boxes[2], 0.0f, 1.0f);
+if (currentMode == FIG1_UPWARD) {
+    // Step mapping (Fig.1):
+    //  0: (a) Initial
+    //  1: (b) Eval: Ground-X          (no position change)
+    //  2: (c) Apply to X (Top)        (resolve Ground-X)
+    //  3: (d) Eval: X-Y               (no position change)
+    //  4: (e) Apply to Y (Top)        (resolve X-Y with X treated as infinite)
+    //  5: (f) Eval: Y-Z               (no position change)
+    //  6: (g) Apply to Z (Top)        (resolve Y-Z with Y treated as infinite)
+    //
+    // 1-2: Eval steps must not change the state. update() prevents calling stepPhysics
+    //      on Eval steps; we also early-out here for safety.
+    //
+    // 1-3: Use a velocity-level projected Gauss-Seidel (PGS) impulse iteration
+    //      (with Baumgarte-style bias) instead of position projection and
+    //      remove any "force v=0, w=0" behavior.
+    if (currentStep != 2 && currentStep != 4 && currentStep != 6) {
         return;
     }
+
+    struct LambdaState {
+        float lambdaN = 0.0f;
+        glm::vec2 lambdaT = glm::vec2(0.0f);
+    };
+
+    auto buildTangentBasis = [&](const glm::vec3& n, glm::vec3& t1, glm::vec3& t2) {
+        glm::vec3 a = (std::abs(n.y) < 0.9f) ? glm::vec3(0, 1, 0) : glm::vec3(1, 0, 0);
+        t1 = glm::normalize(glm::cross(a, n));
+        t2 = glm::cross(n, t1);
+    };
+
+    auto effectiveMass = [&](const glm::vec3& dir,
+                             float invMassA, const glm::mat3& invIA, const glm::vec3& rA,
+                             float invMassB, const glm::mat3& invIB, const glm::vec3& rB) -> float {
+        float k = invMassA + invMassB;
+        if (invMassA > 0.0f) {
+            glm::vec3 angA = invIA * glm::cross(rA, dir);
+            k += glm::dot(glm::cross(angA, rA), dir);
+        }
+        if (invMassB > 0.0f) {
+            glm::vec3 angB = invIB * glm::cross(rB, dir);
+            k += glm::dot(glm::cross(angB, rB), dir);
+        }
+        return k;
+    };
+
+    auto applyImpulse = [&](Box& a, Box& b,
+                            const glm::vec3& p, const glm::vec3& J,
+                            float invMassA, const glm::mat3& invIA,
+                            float invMassB, const glm::mat3& invIB) {
+        glm::vec3 rA = p - a.getPosition();
+        glm::vec3 rB = p - b.getPosition();
+
+        if (invMassA > 0.0f) {
+            a.setVelocity(a.getVelocity() - invMassA * J);
+            a.setAngularVelocity(a.getAngularVelocity() - invIA * glm::cross(rA, J));
+        }
+        if (invMassB > 0.0f) {
+            b.setVelocity(b.getVelocity() + invMassB * J);
+            b.setAngularVelocity(b.getAngularVelocity() + invIB * glm::cross(rB, J));
+        }
+    };
+
+    auto solveContactPGS = [&](Box& a, Box& b, const Contact& c,
+                               float wA, float wB, LambdaState& L,
+                               float dtLocal, float mu) {
+        glm::vec3 n = c.normal;
+        glm::vec3 p = c.point;
+
+        float invMassA = a.getInvMass() * wA;
+        float invMassB = b.getInvMass() * wB;
+        glm::mat3 invIA = computeInvInertiaWorld(a, wA);
+        glm::mat3 invIB = computeInvInertiaWorld(b, wB);
+
+        // Treat "infinite" bodies (w=0) as having zero velocities in the solver.
+        glm::vec3 vA = (wA > 0.0f) ? a.getVelocity() : glm::vec3(0.0f);
+        glm::vec3 wAngA = (wA > 0.0f) ? a.getAngularVelocity() : glm::vec3(0.0f);
+        glm::vec3 vB = (wB > 0.0f) ? b.getVelocity() : glm::vec3(0.0f);
+        glm::vec3 wAngB = (wB > 0.0f) ? b.getAngularVelocity() : glm::vec3(0.0f);
+
+        glm::vec3 rA = p - a.getPosition();
+        glm::vec3 rB = p - b.getPosition();
+
+        // Relative velocity at contact.
+        glm::vec3 vRel = (vB + glm::cross(wAngB, rB)) - (vA + glm::cross(wAngA, rA));
+        float vn = glm::dot(vRel, n);
+
+        // Baumgarte bias: C is signed distance (negative when penetrating).
+        constexpr float kSlop = 1e-4f;
+        constexpr float kBeta = 0.35f;
+        float pen = std::max(0.0f, c.penetration - kSlop);
+        float bias = (dtLocal > 0.0f) ? (-kBeta * pen / dtLocal) : 0.0f;
+
+        float kN = effectiveMass(n, invMassA, invIA, rA, invMassB, invIB, rB);
+        if (kN > 1e-10f) {
+            float dl = -(vn + bias) / kN;
+            float old = L.lambdaN;
+            L.lambdaN = std::max(old + dl, 0.0f);
+            float dLambda = L.lambdaN - old;
+            if (dLambda != 0.0f) {
+                glm::vec3 J = dLambda * n;
+                applyImpulse(a, b, p, J, invMassA, invIA, invMassB, invIB);
+            }
+        }
+
+        // Friction (2D tangential space).
+        glm::vec3 t1, t2;
+        buildTangentBasis(n, t1, t2);
+
+        // Recompute vRel after normal impulse.
+        vA = (wA > 0.0f) ? a.getVelocity() : glm::vec3(0.0f);
+        wAngA = (wA > 0.0f) ? a.getAngularVelocity() : glm::vec3(0.0f);
+        vB = (wB > 0.0f) ? b.getVelocity() : glm::vec3(0.0f);
+        wAngB = (wB > 0.0f) ? b.getAngularVelocity() : glm::vec3(0.0f);
+        vRel = (vB + glm::cross(wAngB, rB)) - (vA + glm::cross(wAngA, rA));
+
+        float vt1 = glm::dot(vRel, t1);
+        float vt2 = glm::dot(vRel, t2);
+
+        glm::vec2 oldT = L.lambdaT;
+        float kT1 = effectiveMass(t1, invMassA, invIA, rA, invMassB, invIB, rB);
+        float kT2 = effectiveMass(t2, invMassA, invIA, rA, invMassB, invIB, rB);
+
+        if (kT1 > 1e-10f) L.lambdaT.x += (-vt1 / kT1);
+        if (kT2 > 1e-10f) L.lambdaT.y += (-vt2 / kT2);
+
+        float maxT = mu * L.lambdaN;
+        float tLen = glm::length(L.lambdaT);
+        if (tLen > maxT) {
+            if (tLen > 1e-10f) L.lambdaT *= (maxT / tLen);
+            else L.lambdaT = glm::vec2(0.0f);
+        }
+
+        glm::vec2 dT = L.lambdaT - oldT;
+        glm::vec3 Jt = dT.x * t1 + dT.y * t2;
+        if (glm::length2(Jt) > 1e-12f) {
+            applyImpulse(a, b, p, Jt, invMassA, invIA, invMassB, invIB);
+        }
+    };
+
+    auto solveGroundPGS = [&](Box& box, const glm::vec3& p, float penetration,
+                             LambdaState& L, float dtLocal, float mu) {
+        glm::vec3 n(0, 1, 0);
+        glm::vec3 r = p - box.getPosition();
+
+        float invMass = box.getInvMass();
+        glm::mat3 invI = computeInvInertiaWorld(box, 1.0f);
+
+        glm::vec3 v = box.getVelocity();
+        glm::vec3 wAng = box.getAngularVelocity();
+        glm::vec3 vRel = v + glm::cross(wAng, r);
+        float vn = glm::dot(vRel, n);
+
+        constexpr float kSlop = 1e-4f;
+        constexpr float kBeta = 0.35f;
+        float pen = std::max(0.0f, penetration - kSlop);
+        float bias = (dtLocal > 0.0f) ? (-kBeta * pen / dtLocal) : 0.0f;
+
+        float kN = invMass + glm::dot(glm::cross(invI * glm::cross(r, n), r), n);
+        if (kN > 1e-10f) {
+            float dl = -(vn + bias) / kN;
+            float old = L.lambdaN;
+            L.lambdaN = std::max(old + dl, 0.0f);
+            float dLambda = L.lambdaN - old;
+            if (dLambda != 0.0f) {
+                glm::vec3 J = dLambda * n;
+                box.setVelocity(box.getVelocity() + invMass * J);
+                box.setAngularVelocity(box.getAngularVelocity() + invI * glm::cross(r, J));
+            }
+        }
+
+        glm::vec3 t1, t2;
+        buildTangentBasis(n, t1, t2);
+
+        // Recompute vRel after normal impulse.
+        v = box.getVelocity();
+        wAng = box.getAngularVelocity();
+        vRel = v + glm::cross(wAng, r);
+
+        float vt1 = glm::dot(vRel, t1);
+        float vt2 = glm::dot(vRel, t2);
+
+        glm::vec2 oldT = L.lambdaT;
+        float kT1 = invMass + glm::dot(glm::cross(invI * glm::cross(r, t1), r), t1);
+        float kT2 = invMass + glm::dot(glm::cross(invI * glm::cross(r, t2), r), t2);
+
+        if (kT1 > 1e-10f) L.lambdaT.x += (-vt1 / kT1);
+        if (kT2 > 1e-10f) L.lambdaT.y += (-vt2 / kT2);
+
+        float maxT = mu * L.lambdaN;
+        float tLen = glm::length(L.lambdaT);
+        if (tLen > maxT) {
+            if (tLen > 1e-10f) L.lambdaT *= (maxT / tLen);
+            else L.lambdaT = glm::vec2(0.0f);
+        }
+
+        glm::vec2 dT = L.lambdaT - oldT;
+        glm::vec3 Jt = dT.x * t1 + dT.y * t2;
+        if (glm::length2(Jt) > 1e-12f) {
+            box.setVelocity(box.getVelocity() + invMass * Jt);
+            box.setAngularVelocity(box.getAngularVelocity() + invI * glm::cross(r, Jt));
+        }
+    };
+
+    auto integrate = [&](Box& box, float h) {
+        box.setPosition(box.getPosition() + box.getVelocity() * h);
+        integrateOrientation(box, h);
+    };
+
+    constexpr int kOuterIters = 120;
+    constexpr int kPgsIters = 8;
+    constexpr float kTolPen = 5e-4f;
+    constexpr float kMu = 0.5f;
+    constexpr float kVelDamp = 0.5f;
+    constexpr float kAngDamp = 0.5f;
+
+    if (currentStep == 2) {
+        // Ground-X: apply to X only.
+        Box& x = boxes[0];
+        LambdaState L;
+        for (int it = 0; it < kOuterIters; ++it) {
+            glm::vec3 pMin;
+            float minY = computeMinYVertex(x, &pMin);
+            if (minY >= -kTolPen) break;
+
+            float pen = -minY;
+            for (int k = 0; k < kPgsIters; ++k) {
+                solveGroundPGS(x, pMin, pen, L, dt, kMu);
+            }
+
+            integrate(x, dt);
+
+            x.setVelocity(x.getVelocity() * kVelDamp);
+            x.setAngularVelocity(x.getAngularVelocity() * kAngDamp);
+        }
+    } else if (currentStep == 4) {
+        // X-Y: apply to Y only (X treated as infinite).
+        Box& x = boxes[0];
+        Box& y = boxes[1];
+        LambdaState L;
+        for (int it = 0; it < kOuterIters; ++it) {
+            Contact c;
+            if (!checkCollision(x, y, c)) break;
+            if (c.penetration <= kTolPen) break;
+
+            for (int k = 0; k < kPgsIters; ++k) {
+                solveContactPGS(x, y, c, 0.0f, 1.0f, L, dt, kMu);
+            }
+
+            integrate(y, dt);
+
+            y.setVelocity(y.getVelocity() * kVelDamp);
+            y.setAngularVelocity(y.getAngularVelocity() * kAngDamp);
+        }
+    } else if (currentStep == 6) {
+        // Y-Z: apply to Z only (Y treated as infinite).
+        Box& y = boxes[1];
+        Box& z = boxes[2];
+        LambdaState L;
+        for (int it = 0; it < kOuterIters; ++it) {
+            Contact c;
+            if (!checkCollision(y, z, c)) break;
+            if (c.penetration <= kTolPen) break;
+
+            for (int k = 0; k < kPgsIters; ++k) {
+                solveContactPGS(y, z, c, 0.0f, 1.0f, L, dt, kMu);
+            }
+
+            integrate(z, dt);
+
+            z.setVelocity(z.getVelocity() * kVelDamp);
+            z.setAngularVelocity(z.getAngularVelocity() * kAngDamp);
+        }
+    }
+
+    return;
+}
 
     // 1. Upward Pass (Shock Propagation)
     // Solve from bottom to top, treating the bottom object as static (infinite mass)
@@ -654,6 +918,7 @@ std::string Simulation::getCurrentStepDescription() const {
 
 void Simulation::updateStep() {
     impulses.clear();
+    figStepSolved = false;
     printStepExplanation();
     
     glm::vec3 yellowImpulse(1.0f, 0.8f, 0.0f);

@@ -55,6 +55,7 @@ private:
     bool isAutoPlay;
     float autoPlayTimer;
     float autoPlayInterval;
+    bool figStepSolved;
     
     std::vector<Box> boxes;
     std::vector<Impulse> impulses;
